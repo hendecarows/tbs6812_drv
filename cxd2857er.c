@@ -14,6 +14,8 @@
 #include <linux/types.h>
 #include <media/dvb_frontend.h>
 #include <linux/mutex.h>
+#include <linux/math64.h>
+#include <linux/jiffies.h>
 
 #include "cxd2857.h"
 #include "cxd2857_priv.h"
@@ -56,6 +58,8 @@ struct cxd2878_dev {
 	u32 atscNoSignalThresh;
 	u32 atscSignalThresh;
 	u32 tune_time;
+	u64 cable_bit_errors, cable_bits, cable_block_errors, cable_blocks;
+	unsigned long cable_ber_next, cable_per_next;
 };
 
 static struct sony_freia_terr_adjust_param_t
@@ -69,6 +73,8 @@ static struct sony_freia_terr_adjust_param_t
 		[SONY_FREIA_DTV_ISDBT_8] = { AUTO, 0x07, 0x0d, 0x0d, 0x0d, 0x03,
 					     0x03, 0x03, 0x00, BW_8, OFFSET(-5),
 					     OFFSET(-7), AUTO, AUTO },
+		[SONY_FREIA_DTV_CABLE_6] = { AUTO, 0x03, 0x0b, 0x0b, 0x0b, 0x03,
+			0x03, 0x03, 0x00, BW_6, OFFSET(-6), OFFSET(-4), AUTO, AUTO },
 	};
 
 static const u8 log2LookUp[] = {
@@ -140,7 +146,7 @@ static s32 sony_Convert2SComplement(u32 value, u32 bitlen)
 	}
 }
 /*write multi registers*/
-static int cxd2878_wrm(struct cxd2878_dev *dev, u8 addr, u8 reg, u8 *buf,
+static int cxd2878_wrm(struct cxd2878_dev *dev, u8 addr, u8 reg, const u8 *buf,
 		       u8 len)
 {
 	int ret;
@@ -154,7 +160,9 @@ static int cxd2878_wrm(struct cxd2878_dev *dev, u8 addr, u8 reg, u8 *buf,
 		.len = len + 1,
 	};
 	ret = i2c_transfer(dev->base->i2c, &msg, 1);
-	if (ret < 0) {
+	if (ret != 1) {
+		if (ret >= 0)
+			ret = -EIO;
 		dev_warn(&dev->base->i2c->dev,
 			 "%s: i2c wrm err(%i) @0x%02x (len=%d)\n",
 			 KBUILD_MODNAME, ret, reg, len);
@@ -180,7 +188,9 @@ static int cxd2878_rdm(struct cxd2878_dev *dev, u8 addr, u8 reg, u8 *buf,
 	};
 
 	ret = i2c_transfer(dev->base->i2c, msg, 2);
-	if (ret < 0) {
+	if (ret != 2) {
+		if (ret >= 0)
+			ret = -EIO;
 		dev_warn(&dev->base->i2c->dev,
 			 "%s: i2c rdm err(%i) @0x%02x (len=%d)\n",
 			 KBUILD_MODNAME, ret, addr, len);
@@ -258,7 +268,7 @@ err:
 	return ret;
 }
 
-static int cxd2857_read_rssi_isdbt(struct cxd2878_dev *dev, u32 frequency,
+static int cxd2857_read_rssi_terr(struct cxd2878_dev *dev, u32 frequency,
 				   s32 *rssi)
 {
 	int ret = 0;
@@ -283,12 +293,16 @@ static int cxd2857_read_rssi_isdbt(struct cxd2878_dev *dev, u32 frequency,
 		goto err;
 	msleep(4);
 
-	ret |= cxd2878_rdm(dev, dev->tuner_addr, 0x1a, &tmp, 1);
+	ret = cxd2878_rdm(dev, dev->tuner_addr, 0x1a, &tmp, 1);
+	if (ret)
+		goto err;
 	if (tmp != 0) {
 		ret = -EINVAL;
 		goto err;
 	}
-	ret |= cxd2878_rdm(dev, dev->tuner_addr, 0x19, &tmp, 1);
+	ret = cxd2878_rdm(dev, dev->tuner_addr, 0x19, &tmp, 1);
+	if (ret)
+		goto err;
 	d = tmp & 0xf;
 
 	data[0] = 0x05;
@@ -312,7 +326,9 @@ static int cxd2857_read_rssi_isdbt(struct cxd2878_dev *dev, u32 frequency,
 
 	agcreg_x140 = ifagc * 140;
 
-	cxd2878_rdm(dev, dev->tuner_addr, 0x69, &tmp, 1);
+	ret = cxd2878_rdm(dev, dev->tuner_addr, 0x69, &tmp, 1);
+	if (ret)
+		goto err;
 	if_bpf_gc_x100 = if_bpf_gc_table[tmp & 0xF] * 100;
 	if (agcreg_x140 >= 10200)
 		ifgain = if_bpf_gc_x100 + 820;
@@ -415,7 +431,11 @@ static int cxd2857_read_rssi_isdbt(struct cxd2878_dev *dev, u32 frequency,
 	return 0;
 
 err:
-	dev_err(&dev->base->i2c->dev, "%s : cxd2857_read_rssi_isdbt failed! \n",
+	/* Restore tuner measurement controls even after a failed read. */
+	cxd2878_wr(dev, dev->tuner_addr, 0x59, 0x04);
+	cxd2878_wr(dev, dev->tuner_addr, 0x88, 0x00);
+	cxd2878_wr(dev, dev->tuner_addr, 0x87, 0xC0);
+	dev_err(&dev->base->i2c->dev, "%s : cxd2857_read_rssi_terr failed! \n",
 		KBUILD_MODNAME);
 	return ret;
 }
@@ -718,6 +738,11 @@ static int cxd2857_tune(struct cxd2878_dev *dev, u32 frequencykHz)
 	enum sony_tuner_state_t tuner_state = SONY_TUNER_STATE_NONE;
 
 	switch (dev->system) {
+	case SONY_DTV_SYSTEM_DVBC:
+		tvSystem = SONY_FREIA_DTV_CABLE_6;
+		tuner_state = SONY_TUNER_STATE_T;
+		frequencykHz /= 1000;
+		break;
 	case SONY_DTV_SYSTEM_ISDBT:
 		switch (dev->bandwidth) {
 		case SONY_DTV_BW_6_MHZ:
@@ -1445,6 +1470,12 @@ static int cxd2878_sleep(struct dvb_frontend *fe)
 		cxd2878_setTSDataPinHiZ(dev, 1);
 
 		switch (dev->system) {
+		case SONY_DTV_SYSTEM_DVBC:
+			cxd2878_wr(dev, dev->slvt, 0x00, 0x11);
+			cxd2878_wr(dev, dev->slvt, 0xA3, 0x00);
+			cxd2878_wr(dev, dev->slvt, 0x00, 0x48);
+			cxd2878_wr(dev, dev->slvt, 0x2C, 0x01);
+			fallthrough;
 		case SONY_DTV_SYSTEM_ISDBT: {
 			cxd2878_wr(dev, dev->slvt, 0x00, 0x10);
 			cxd2878_wr(dev, dev->slvt, 0x69, 0x05);
@@ -1806,6 +1837,140 @@ err:
 	dev_err(&dev->base->i2c->dev, "%s: SLtoAIS3 error !", KBUILD_MODNAME);
 	return ret;
 }
+/* Experimental ISDB-C profile: DVB-C Annex A, 6 MHz, 5.274 MBaud.
+ * Register values follow tbsdtv/linux_media cxd2878.c SLtoAC (GPL-2.0).
+ * The demodulator automatically acquires QAM and symbol rate in this range.
+ */
+static int cxd2878_set_isdbc(struct dvb_frontend *fe)
+{
+	struct cxd2878_dev *dev = fe->demodulator_priv;
+	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
+	const u8 coefficients[] = { 0x31, 0xA8, 0x29, 0x9B, 0x27, 0x9C,
+		0x28, 0x9E, 0x29, 0xA4, 0x29, 0xA2, 0x29, 0xA8 };
+	const u8 rate_range[] = { 0x07, 0x33, 0x00, 0xEE };
+	const u8 adc[] = { 0x00, 0x03, 0x3B };
+	const u8 ts[] = { 0x01, 0x01 };
+	u32 iffreq = dev->iffreqConfig.configDVBC_6;
+	u8 data[] = { iffreq >> 16, iffreq >> 8, iffreq };
+	int ret;
+
+	/* DVB core derives bandwidth as symbol_rate * 115/100 (A), 113/100 (C),
+	 * overriding DTV_BANDWIDTH_HZ. Accept that API value for this fixed
+	 * 6 MHz profile, while keeping ISDBC's explicit bandwidth validation.
+	 */
+	if ((c->bandwidth_hz && c->bandwidth_hz != 6000000 &&
+	     !(c->symbol_rate == 5274000 &&
+	       ((c->delivery_system == SYS_DVBC_ANNEX_A && c->bandwidth_hz == 6065100) ||
+	        (c->delivery_system == SYS_DVBC_ANNEX_C && c->bandwidth_hz == 5959620)))) ||
+	    (c->symbol_rate && c->symbol_rate != 5274000) ||
+	    (c->modulation != QAM_AUTO && c->modulation != QAM_64 &&
+	     c->modulation != QAM_256) ||
+	    c->frequency < 45000000 || c->frequency > 868000000)
+		return -EINVAL;
+	if (dev->state == SONY_DEMOD_STATE_ACTIVE) {
+		ret = cxd2878_sleep(fe);
+		if (ret)
+			return ret;
+	}
+	if (dev->state != SONY_DEMOD_STATE_SLEEP)
+		return -EINVAL;
+
+	dev->system = SONY_DTV_SYSTEM_DVBC;
+	dev->bandwidth = SONY_DTV_BW_6_MHZ;
+	ret = cxd2878_setTSClkModeAndFreq(dev);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvx, 0x00, 0x00);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvx, 0x17, 0x04);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0xA9, 0x00);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x2C, 0x01);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x4B, 0x74);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x49, 0x00);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvx, 0x18, 0x00);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x11);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x6A, 0x48);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x10);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0xA5, 0x01);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x11);
+	if (ret)
+		return ret;
+	ret = cxd2878_wrm(dev, dev->slvt, 0x33, adc, sizeof(adc));
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x48);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x2C, 0x03);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
+	if (ret)
+		return ret;
+	ret = cxd2878_wrm(dev, dev->slvt, 0xCE, ts, sizeof(ts));
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x10);
+	if (ret)
+		return ret;
+	ret = cxd2878_wrm(dev, dev->slvt, 0xA6, coefficients, sizeof(coefficients));
+	if (ret)
+		return ret;
+	ret = cxd2878_wrm(dev, dev->slvt, 0xB6, data, sizeof(data));
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x11);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0xA3, 0x14);
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x40);
+	if (ret)
+		return ret;
+	ret = cxd2878_wrm(dev, dev->slvt, 0x26, rate_range, sizeof(rate_range));
+	if (ret)
+		return ret;
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x00);
+	if (ret)
+		return ret;
+	ret = cxd2878_SetRegisterBits(dev, dev->slvt, 0x80, 0x08, 0x1F);
+	if (ret)
+		return ret;
+	ret = cxd2878_setTSDataPinHiZ(dev, 0);
+	if (ret)
+		return ret;
+	dev->cable_bit_errors = dev->cable_bits = 0;
+	dev->cable_block_errors = dev->cable_blocks = 0;
+	dev->cable_ber_next = dev->cable_per_next = jiffies;
+	dev->state = SONY_DEMOD_STATE_ACTIVE;
+	return 0;
+}
+
 static int cxd2878_set_isdbt(struct dvb_frontend *fe)
 {
 	struct cxd2878_dev *dev = fe->demodulator_priv;
@@ -2065,6 +2230,124 @@ err:
 	return ret;
 }
 
+/* Cable monitor registers and C/N formula: cxd2878.c / cxd2841er.c.
+ * Counters accumulate sampled hardware windows (at most once per second).
+ * Use u64 for 2^31 * 204 * 8 to avoid the reference driver's overflow.
+ */
+static int cxd2878_read_cable_stats(struct dvb_frontend *fe, bool locked)
+{
+	struct cxd2878_dev *dev = fe->demodulator_priv;
+	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
+	u8 qam, noise[2], ber[3], period, packets[4], sync, ts;
+	u32 estimate, errors, packet_errors;
+	u64 bits, blocks;
+	s32 rflevel, cnr;
+	int ret, cleanup;
+
+	ret = cxd2878_i2c_repeater(dev, 1);
+	if (!ret)
+		ret = cxd2857_read_rssi_terr(dev, c->frequency / 1000, &rflevel);
+	cleanup = cxd2878_i2c_repeater(dev, 0);
+	if (ret || cleanup)
+		return ret ? ret : cleanup;
+	/* RSSI is in 0.01 dBm; cable IF output correction is 1.5 dB. */
+	c->strength.stat[0].svalue = (s64)rflevel * 10 - 1500;
+	c->strength.stat[0].scale = FE_SCALE_DECIBEL;
+	c->strength.len = 2;
+	c->strength.stat[1].scale = FE_SCALE_RELATIVE;
+	c->strength.stat[1].uvalue =
+		clamp_t(s64, (c->strength.stat[0].svalue + 100000) * 65535 / 80000,
+			0, 65535);
+	if (!locked)
+		return 0;
+
+	ret = cxd2878_wr(dev, dev->slvt, 0x01, 0x01);
+	if (ret)
+		goto unfreeze;
+	ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x40);
+	if (ret)
+		goto unfreeze;
+	/* Recheck lock in the frozen snapshot before interpreting monitors. */
+	ret = cxd2878_rdm(dev, dev->slvt, 0x88, &sync, 1);
+	if (ret)
+		goto unfreeze;
+	ret = cxd2878_rdm(dev, dev->slvt, 0x10, &ts, 1);
+	if (ret || (sync & 0x03) != 0x01 || !(ts & 0x20))
+		goto unfreeze;
+	ret = cxd2878_rdm(dev, dev->slvt, 0x19, &qam, 1);
+	if (ret)
+		goto unfreeze;
+	ret = cxd2878_rdm(dev, dev->slvt, 0x4C, noise, sizeof(noise));
+	if (ret)
+		goto unfreeze;
+	ret = cxd2878_rdm(dev, dev->slvt, 0x62, ber, sizeof(ber));
+	if (ret)
+		goto unfreeze;
+	ret = cxd2878_rdm(dev, dev->slvt, 0x60, &period, 1);
+	if (ret)
+		goto unfreeze;
+	ret = cxd2878_rdm(dev, dev->slvt, 0x5C, packets, sizeof(packets));
+	if (ret)
+		goto unfreeze;
+	cleanup = cxd2878_wr(dev, dev->slvt, 0x01, 0x00);
+	if (cleanup)
+		return cleanup;
+
+	estimate = ((noise[0] & 0x1F) << 8) | noise[1];
+	qam &= 0x07;
+	if (estimate && qam <= 4) {
+		/* sony_math_log2 returns log2(x) * 100. Convert to ln(x) * 100. */
+		if (qam == 1 || qam == 3) {
+			estimate = max(estimate, 69U);
+			cnr = 86999 - 88 * (s32)((100 * sony_math_log2(estimate) + 72) / 144);
+		} else {
+			estimate = max(estimate, 126U);
+			cnr = 95941 - 95 * (s32)((100 * sony_math_log2(estimate) + 72) / 144);
+		}
+		c->cnr.stat[0].scale = FE_SCALE_DECIBEL;
+		c->cnr.stat[0].svalue = cnr;
+		c->cnr.len = 2;
+		c->cnr.stat[1].scale = FE_SCALE_RELATIVE;
+		c->cnr.stat[1].uvalue = clamp(cnr, 0, 50000) * 65535ULL / 50000;
+	}
+	errors = ((u32)(ber[0] & 0x3F) << 16) | (ber[1] << 8) | ber[2];
+	bits = (1ULL << (period & 0x1F)) * 204 * 8;
+	if ((ber[0] & 0x80) && errors <= bits) {
+		if (time_after_eq(jiffies, dev->cable_ber_next)) {
+			dev->cable_bit_errors += errors;
+			dev->cable_bits += bits;
+			/* Wait at least one measurement window, and at least 1 s.
+			 * 16-QAM gives the longest bit window among valid cable QAMs.
+			 */
+			dev->cable_ber_next = jiffies + max_t(u64, HZ,
+				div64_u64(bits * HZ, 5274000ULL * 4) + 1);
+		}
+		c->post_bit_error.stat[0].scale = FE_SCALE_COUNTER;
+		c->post_bit_error.stat[0].uvalue = dev->cable_bit_errors;
+		c->post_bit_count.stat[0].scale = FE_SCALE_COUNTER;
+		c->post_bit_count.stat[0].uvalue = dev->cable_bits;
+	}
+	packet_errors = ((u32)(packets[1] & 0x03) << 16) |
+		(packets[2] << 8) | packets[3];
+	blocks = 1ULL << (packets[0] & 0x1F);
+	if ((packets[1] & 0x04) && packet_errors <= blocks) {
+		if (time_after_eq(jiffies, dev->cable_per_next)) {
+			dev->cable_block_errors += packet_errors;
+			dev->cable_blocks += blocks;
+			dev->cable_per_next = jiffies + max_t(u64, HZ,
+				div64_u64(blocks * 204 * 8 * HZ, 5274000ULL * 4) + 1);
+		}
+		c->block_error.stat[0].scale = FE_SCALE_COUNTER;
+		c->block_error.stat[0].uvalue = dev->cable_block_errors;
+		c->block_count.stat[0].scale = FE_SCALE_COUNTER;
+		c->block_count.stat[0].uvalue = dev->cable_blocks;
+	}
+	return 0;
+unfreeze:
+	cleanup = cxd2878_wr(dev, dev->slvt, 0x01, 0x00);
+	return ret ? ret : cleanup;
+}
+
 static int cxd2878_read_status(struct dvb_frontend *fe, enum fe_status *status)
 {
 	struct cxd2878_dev *dev = fe->demodulator_priv;
@@ -2080,8 +2363,53 @@ static int cxd2878_read_status(struct dvb_frontend *fe, enum fe_status *status)
 
 	mutex_lock(&dev->base->i2c_lock);
 
+	/* Clear cable-only block statistics also when changing delivery system. */
+	c->block_error.len = 1;
+	c->block_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->block_count.len = 1;
+	c->block_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 	*status = 0;
 	switch (c->delivery_system) {
+	case SYS_DVBC_ANNEX_A:
+	case SYS_DVBC_ANNEX_C:
+	case SYS_ISDBC:
+		c->strength.len = 1;
+		c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+		c->cnr.len = 1;
+		c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+		c->post_bit_error.len = 1;
+		c->post_bit_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+		c->post_bit_count.len = 1;
+		c->post_bit_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+		c->block_error.len = 1;
+		c->block_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+		c->block_count.len = 1;
+		c->block_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+		if (dev->state != SONY_DEMOD_STATE_ACTIVE ||
+		    dev->system != SONY_DTV_SYSTEM_DVBC)
+			goto cable_done;
+		ret = cxd2878_wr(dev, dev->slvt, 0x00, 0x40);
+		if (ret)
+			goto err;
+		ret = cxd2878_rdm(dev, dev->slvt, 0x88, &data, 1);
+		if (ret)
+			goto err;
+		syncstat = data & 0x01;
+		unlockdetected = data & 0x02;
+		ret = cxd2878_rdm(dev, dev->slvt, 0x10, &data, 1);
+		if (ret)
+			goto err;
+		if (syncstat && !unlockdetected) {
+			*status = FE_HAS_SIGNAL | FE_HAS_CARRIER;
+			if (data & 0x20)
+				*status |= FE_HAS_VITERBI | FE_HAS_SYNC | FE_HAS_LOCK;
+		}
+		ret = cxd2878_read_cable_stats(fe, *status & FE_HAS_LOCK);
+		if (ret)
+			goto err;
+	cable_done:
+		mutex_unlock(&dev->base->i2c_lock);
+		return 0;
 	case SYS_ISDBT:
 		cxd2878_wr(dev, dev->slvt, 0x00, 0x60);
 		cxd2878_rdm(dev, dev->slvt, 0x10, &data, 1);
@@ -2136,7 +2464,7 @@ static int cxd2878_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	switch (c->delivery_system) {
 	case SYS_ISDBT:
 		ret |= cxd2878_i2c_repeater(dev, 1);
-		ret |= cxd2857_read_rssi_isdbt(dev, c->frequency / 1000,
+		ret |= cxd2857_read_rssi_terr(dev, c->frequency / 1000,
 					       &rflevel);
 		ret |= cxd2878_i2c_repeater(dev, 0);
 		c->strength.len = 1;
@@ -2272,6 +2600,11 @@ static int cxd2878_set_frontend(struct dvb_frontend *fe)
 		dev->base->config.TS_switch(dev->base->i2c, 1);
 
 	switch (c->delivery_system) {
+	case SYS_DVBC_ANNEX_A:
+	case SYS_DVBC_ANNEX_C:
+	case SYS_ISDBC:
+		ret = cxd2878_set_isdbc(fe);
+		break;
 	case SYS_ISDBT:
 		ret = cxd2878_set_isdbt(fe);
 		break;
@@ -2281,6 +2614,9 @@ static int cxd2878_set_frontend(struct dvb_frontend *fe)
 	default:
 		goto err;
 	}
+
+	if (ret)
+		goto err;
 
 	// set tuner
 	ret |= cxd2878_i2c_repeater(dev, 1);
@@ -2356,6 +2692,7 @@ static int cxd2878_set_property(struct dvb_frontend *fe, u32 cmd, u32 data)
 		case SYS_DVBC_ANNEX_A:
 		case SYS_DVBC_ANNEX_B:
 		case SYS_DVBC_ANNEX_C:
+		case SYS_ISDBC:
 			fe->ops.info.frequency_min_hz = 47 * MHz;
 			fe->ops.info.frequency_max_hz = 862 * MHz;
 			fe->ops.info.frequency_stepsize_hz = 62500;
@@ -2381,13 +2718,12 @@ static int cxd2878_read_ber(struct dvb_frontend *fe, u32 *ber)
 {
 	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
 
+	*ber = 0;
 	if (p->post_bit_error.stat[0].scale == FE_SCALE_COUNTER &&
-	    p->post_bit_count.stat[0].scale == FE_SCALE_COUNTER)
-		*ber = (u32)p->post_bit_count.stat[0].uvalue ?
-			       (u32)p->post_bit_error.stat[0].uvalue /
-				       (u32)p->post_bit_count.stat[0].uvalue :
-			       0;
-
+	    p->post_bit_count.stat[0].scale == FE_SCALE_COUNTER &&
+	    p->post_bit_count.stat[0].uvalue)
+		*ber = div64_u64(p->post_bit_error.stat[0].uvalue * 10000000ULL,
+				 p->post_bit_count.stat[0].uvalue);
 	return 0;
 }
 static int cxd2878_read_signal_strength(struct dvb_frontend *fe, u16 *strength)
@@ -2417,8 +2753,12 @@ static int cxd2878_read_snr(struct dvb_frontend *fe, u16 *snr)
 
 static int cxd2878_read_ucblocks(struct dvb_frontend *fe, u32 *ucblocks)
 {
-	*ucblocks = 0;
+	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
 
+	*ucblocks = 0;
+	if (p->block_error.len &&
+	    p->block_error.stat[0].scale == FE_SCALE_COUNTER)
+		*ucblocks = min_t(u64, p->block_error.stat[0].uvalue, U32_MAX);
 	return 0;
 }
 #ifdef TBS_DVB_EXTENSION
@@ -2478,7 +2818,7 @@ static void cxd2878_release(struct dvb_frontend *fe)
 }
 
 static const struct dvb_frontend_ops cxd2878_ops = {
-	.delsys = {SYS_ISDBT,SYS_ISDBS},
+	.delsys = {SYS_ISDBT, SYS_ISDBS, SYS_ISDBC, SYS_DVBC_ANNEX_A, SYS_DVBC_ANNEX_C},
 	.info = {
 			.name = "SONY CXD2857",
 			.frequency_min_hz = 45*MHz,
@@ -2496,6 +2836,7 @@ static const struct dvb_frontend_ops cxd2878_ops = {
 				FE_CAN_QAM_16 |
 				FE_CAN_QAM_32 |
 				FE_CAN_QAM_64 |
+				FE_CAN_QAM_256 |
 				FE_CAN_QAM_AUTO |
 				FE_CAN_TRANSMISSION_MODE_AUTO |
 				FE_CAN_GUARD_INTERVAL_AUTO |
